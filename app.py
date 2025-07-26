@@ -1,245 +1,461 @@
-import streamlit as st
-import requests
-from io import BytesIO
-import traceback
-import xml.etree.ElementTree as ET
+import os
 import json
-import time
+import yaml
+import uuid
+import tempfile
+import shutil
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, abort, send_file
+from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
+from flask_cors import CORS
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
+import requests  # For OpenRouter API calls
+import pandas as pd  # For CSV/Excel processing
+from docx import Document as DocxDocument  # For DOCX generation
+from fpdf import FPDF  # For PDF generation
+
+# LangChain imports (still used for text processing)
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app, origins=["http://localhost:8501", "http://127.0.0.1:8501"], 
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"])
 
 # Configuration
-BACKEND_URL = "http://127.0.0.1:5001"  # Update if your backend runs on a different port
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 400
+SUPPORTED_DOC_TYPES = [".pdf", ".docx", ".txt", ".csv", ".xlsx"]
+SUPPORTED_CONFIG_TYPES = [".yaml", ".yml", ".json"]
+MIN_TEXT_LENGTH = 50
+MAX_CONFIG_SIZE = 1 * 1024 * 1024  # 1MB
+SESSION_EXPIRE_HOURS = 2
 
-st.set_page_config(page_title="Document Analyzer", layout="wide")
-st.title("📄 Advanced Document Analyzer")
-st.markdown("""
-    **Two-step document analysis:**  
-    1. First upload your configuration file  
-    2. Then upload documents for analysis  
-""")
+# In-memory session store (replace with Redis in production)
+sessions = {}
 
-# Initialize session state variables
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = None
-if 'config_uploaded' not in st.session_state:
-    st.session_state.config_uploaded = False
+# OpenRouter configuration
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "anthropic/claude-3-opus"  # Can be changed to any supported model
 
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Workflow")
-    st.markdown("""
-    **How to use:**
-    1. 📝 Upload config file (YAML/JSON)
-    2. 📂 Upload documents (PDF/DOCX/TXT/CSV/XLSX)
-    3. 🔍 Analyze documents
-    4. 📥 Download results
-    """)
+def allowed_document_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in {'pdf', 'docx', 'txt', 'csv', 'xlsx'}
+
+def allowed_config_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in {'yaml', 'yml', 'json'}
+
+def extract_text_with_ocr(pdf_path):
+    """Extract text from PDF with fallback to OCR"""
+    doc = fitz.open(pdf_path)
+    full_text = ""
     
-    if st.session_state.config_uploaded:
-        st.success("✅ Config file uploaded")
-        if st.button("Clear Session"):
-            st.session_state.clear()
-            st.rerun()
-
-# Step 1: Config File Upload
-st.write("")
-st.subheader("Step 1: Upload Configuration File")
-config_file = st.file_uploader(
-    "Choose a config file (YAML or JSON)",
-    type=["yaml", "yml", "json"],
-    key="config_upload",
-    disabled=st.session_state.config_uploaded
-)
-
-if config_file and not st.session_state.config_uploaded:
-    if st.button("Upload Configuration"):
-        with st.spinner("Processing config..."):
-            try:
-                files = {"config_file": (config_file.name, config_file.getvalue())}
-                response = requests.post(
-                    f"{BACKEND_URL}/upload_config",
-                    files=files,
-                    timeout=10
-                )
+    for page_num in range(len(doc)):
+        try:
+            page = doc.load_page(page_num)
+            text = page.get_text("text")
+            
+            if len(text.strip()) < MIN_TEXT_LENGTH:
+                pix = page.get_pixmap(dpi=200)
+                img = Image.open(io.BytesIO(pix.tobytes("ppm")))
+                text = pytesseract.image_to_string(img)
+                text = f"[OCR EXTRACTED]\n{text}\n"
                 
-                if response.status_code == 200:
-                    st.session_state.session_id = response.json().get("session_id")
-                    st.session_state.config_uploaded = True
-                    st.success("Configuration uploaded successfully!")
-                    st.rerun()
-                else:
-                    st.error(f"Error: {response.text}")
-                    
-            except requests.exceptions.ConnectionError:
-                st.error("Cannot connect to backend. Make sure the Flask app is running.")
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                st.code(traceback.format_exc())
+            full_text += text + "\n\n"
+            
+        except Exception as e:
+            continue
+            
+    doc.close()
+    return full_text.strip()
 
-# Step 2: Document Upload and Processing
-if st.session_state.config_uploaded:
-    st.write("")
-    st.write("")
-    st.subheader("Step 2: Upload Documents for Analysis")
-    uploaded_files = st.file_uploader(
-        "Choose documents to analyze",
-        type=["pdf", "docx", "txt", "csv", "xlsx"],
-        accept_multiple_files=True,
-        key="doc_upload"
+def parse_config_file(file):
+    """Parse and validate config file"""
+    try:
+        # Check file size
+        file.seek(0, os.SEEK_END)
+        size = file.tell()
+        file.seek(0)
+        if size > MAX_CONFIG_SIZE:
+            raise ValueError(f"Config file exceeds {MAX_CONFIG_SIZE/1024/1024}MB limit")
+        
+        # Secure temporary file handling
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            file.save(tmp.name)
+            with open(tmp.name, 'r') as f:
+                if file.filename.lower().endswith('.json'):
+                    config = json.load(f)
+                else:
+                    config = yaml.safe_load(f)
+                
+                # Validate config structure
+                if not isinstance(config, dict):
+                    raise ValueError("Config must be a dictionary")
+                
+                if 'fields' not in config:
+                    raise ValueError("Config must contain 'fields' key")
+                
+                if not isinstance(config['fields'], list):
+                    raise ValueError("Fields must be a list")
+                
+                # Validate each field
+                for field in config['fields']:
+                    if not isinstance(field, dict):
+                        raise ValueError("Each field must be a dictionary")
+                    if 'keywords' not in field:
+                        raise ValueError("Field missing 'keywords' list")
+                
+                return config
+                
+    except (yaml.YAMLError, json.JSONDecodeError) as e:
+        raise ValueError(f"Invalid config format: {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Config processing error: {str(e)}")
+
+def query_openrouter(prompt, session_id=None):
+    """Call OpenRouter API with the given prompt"""
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
+    
+    try:
+        response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()['choices'][0]['message']['content']
+    except Exception as e:
+        raise ValueError(f"OpenRouter API error: {str(e)}")
+
+def build_dynamic_prompt(fields, text):
+    """Generate analysis prompt based on fields"""
+    fields_section = "\n".join(
+        f"- {field.get('name', f'field_{i+1}')}: "
+        f"Keywords: {', '.join(field.get('keywords', []))}\n"
+        f"  Response type: {field.get('response_type', 'auto')}\n"
+        f"  Description: {field.get('description', 'N/A')}"
+        for i, field in enumerate(fields)
     )
     
-    if uploaded_files:
-        if st.button("Analyze Documents"):
-            with st.spinner("Processing documents..."):
-                try:
-                    files = [("document_files", (file.name, file.getvalue())) for file in uploaded_files]
-                    data = {"session_id": st.session_state.session_id}
-                    
-                    response = requests.post(
-                        f"{BACKEND_URL}/upload_documents",
-                        files=files,
-                        data=data,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.session_state.extraction_results = result.get("data", {})
-                        st.session_state.text_sample = result.get("text_sample", "")
-                        st.success("Analysis complete!")
-                    else:
-                        st.error(f"Error: {response.text}")
-                
-                except requests.exceptions.ConnectionError:
-                    st.error("Cannot connect to backend. Make sure the Flask app is running.")
-                except Exception as e:
-                    st.error(f"An error occurred: {str(e)}")
-                    st.code(traceback.format_exc())
+    return f"""Analyze this document and extract information:
 
+FIELDS TO EXTRACT:
+{fields_section}
 
+DOCUMENT CONTENT:
+{text[:15000]}
 
-def download_from_backend(format):
+INSTRUCTIONS:
+1. For each field, determine appropriate response format:
+   - Concise: For IDs, numbers, simple facts
+   - Detailed: For policies, conditions
+2. Return JSON with this structure:
+{{
+  "results": [
+    {{
+      "field": "field_name",
+      "value": "extracted_value",
+      "type": "concise/detailed",
+      "confidence": 0.0-1.0
+    }}
+  ]
+}}
+
+OUTPUT:"""
+
+@app.route('/upload_config', methods=['POST'])
+def upload_config():
+    """First step: Upload configuration file"""
+    if 'config_file' not in request.files:
+        abort(400, "No config file uploaded")
+    
+    config_file = request.files['config_file']
+    if not config_file.filename or not allowed_config_file(config_file.filename):
+        abort(400, "Invalid config file type")
+    
     try:
-        session_id = st.session_state.get("session_id")
-        if not session_id:
-            st.error("Session ID missing. Please upload config and analyze a document first.")
-            return None
+        config = parse_config_file(config_file)
+        session_id = str(uuid.uuid4())
+        expiry = datetime.now() + timedelta(hours=SESSION_EXPIRE_HOURS)
         
-        res = requests.get(f"{BACKEND_URL}/download/{format}", params={"session_id": session_id})
-        if res.status_code == 200:
-            return res.content
-        else:
-            st.error(f"Export failed: {res.text}")
-    except Exception as e:
-        st.error(f"Error downloading {format} file: {str(e)}")
-        return None
+        sessions[session_id] = {
+            "config": config,
+            "expiry": expiry
+        }
+        
+        return jsonify({
+            "status": "success",
+            "session_id": session_id,
+            "expires_at": expiry.isoformat()
+        })
+    except ValueError as e:
+        abort(400, str(e))
 
+@app.route('/upload_documents', methods=['POST'])
+def upload_documents():
+    """Second step: Upload documents and process with config"""
+    # Validate session
+    if 'session_id' not in request.form:
+        abort(400, "Session ID required")
+    
+    session_id = request.form['session_id']
+    if session_id not in sessions:
+        abort(400, "Invalid or expired session ID")
+    
+    config = sessions[session_id]['config']
+    
+    # Validate documents
+    if 'document_files' not in request.files:
+        abort(400, "No documents uploaded")
+    
+    document_files = request.files.getlist('document_files')
+    if not document_files or all(f.filename == '' for f in document_files):
+        abort(400, "No selected files")
+    
+    # Process documents
+    documents = []
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        for file in document_files:
+            if not file or not file.filename or not allowed_document_file(file.filename):
+                continue
+                
+            try:
+                filename = secure_filename(file.filename)
+                filepath = os.path.join(temp_dir, filename)
+                file.save(filepath)
+                
+                # Process based on file type
+                if filename.lower().endswith('.pdf'):
+                    try:
+                        loader = PyPDFLoader(filepath)
+                        docs = loader.load()
+                        if sum(len(d.page_content) for d in docs) < MIN_TEXT_LENGTH * len(docs):
+                            full_text = extract_text_with_ocr(filepath)
+                            if full_text.strip():
+                                docs = [Document(page_content=full_text)]
+                    except Exception as e:
+                        full_text = extract_text_with_ocr(filepath)
+                        docs = [Document(page_content=full_text)] if full_text.strip() else []
+                        
+                    documents.extend(docs)
+                    
+                elif filename.lower().endswith('.docx'):
+                    loader = Docx2txtLoader(filepath)
+                    documents.extend(loader.load())
+                elif filename.lower().endswith('.txt'):
+                    loader = TextLoader(filepath)
+                    documents.extend(loader.load())
+                elif filename.lower().endswith('.csv'):
+                        df = pd.read_csv(filepath)
+                        content = df.to_markdown(index=False)
+                        print("Extracted CSV content:\n", content[:300])
+                        docs = [Document(page_content=content, metadata={"source": filename})]
 
-# Display results if available
-if 'extraction_results' in st.session_state:
-    st.write("")
-    st.write("")
-    st.subheader("Analysis Results")
+                elif filename.lower().endswith('.xlsx'):
+                    df = pd.read_excel(filepath, engine='openpyxl')
+                    # 🧹 Clean: remove fully empty rows/columns
+                    df.dropna(how='all', inplace=True)
+                    df.dropna(axis=1, how='all', inplace=True)
+
+                    if not df.empty:
+                        try:
+                            content = df.to_markdown(index=False)
+                        except ImportError:
+                            content = df.to_string(index=False)
+
+                        print("Extracted Excel content:\n", content[:300])
+                        docs = [Document(page_content=content)]
+                    else:
+                        print("WARNING: Excel sheet is empty after cleaning.")
+                        docs = []
+
+                    # Only load if we have a valid loader
+
+                    if docs:
+                        documents.extend(docs)
+                        print(f"Loaded {len(docs)} documents from {filename}")
+                    else:
+                        print(f"WARNING: Unsupported file format: {filename}")
+                        
+                    
+            except Exception as e:
+                continue
     
-    # Show text sample preview
-    with st.expander("📝 View Document Sample", expanded=False):
-        st.text_area("Extracted Text Sample", 
-                    st.session_state.text_sample, 
-                    height=200)
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
     
-    # Results display format
-    st.write("")
-    st.write("")
-    st.subheader("Output Options")
-    format_col1, format_col2 = st.columns(2)
+    if not documents:
+        abort(400, "No valid content extracted from documents")
     
-    with format_col1:
-        output_format = st.radio(
-            "Select output format:",
-            ["JSON", "Text", "XML"],
-            horizontal=True
-        )
+    # Process text
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    splits = text_splitter.split_documents(documents)
     
-    with format_col2:
-        if st.button("Refresh Results"):
-            st.rerun()
+    # Filter out noise
+    filtered_splits = []
+    for doc in splits:
+        content = doc.page_content.strip()
+        if (len(content) > 100 and 
+            not content.count('_') > len(content) * 0.3 and
+            not content.count('.') > len(content) * 0.1):
+            filtered_splits.append(doc)
     
-    # Display results in selected format
-    if output_format == "JSON":
-        st.json(st.session_state.extraction_results)
-    elif output_format == "Text":
-        if "results" in st.session_state.extraction_results:
-            for item in st.session_state.extraction_results["results"]:
-                st.markdown(f"### {item.get('field', 'N/A')}")
-                st.markdown(f"**Type:** {item.get('type', 'N/A')}")
-                st.markdown(f"**Confidence:** {item.get('confidence', 'N/A')}")
-                st.markdown("**Value:**")
-                st.write(item.get('value', 'No value extracted'))
-                st.divider()
-    elif output_format == "XML":
+    full_text = "\n\n".join([doc.page_content for doc in filtered_splits])
+    
+    # Generate and process prompt
+    try:
+        prompt = build_dynamic_prompt(config['fields'], full_text)
+        llm_response = query_openrouter(prompt, session_id)
+        
+        # Extract JSON from response
+        start_idx = llm_response.find('{')
+        end_idx = llm_response.rfind('}') + 1
+        json_result = llm_response[start_idx:end_idx]
+        
         try:
-            root = ET.Element("AnalysisResults")
-            if "results" in st.session_state.extraction_results:
-                for item in st.session_state.extraction_results["results"]:
-                    result_elem = ET.SubElement(root, "Result")
-                    ET.SubElement(result_elem, "Field").text = str(item.get('field', ''))
-                    ET.SubElement(result_elem, "Type").text = str(item.get('type', ''))
-                    ET.SubElement(result_elem, "Confidence").text = str(item.get('confidence', ''))
-                    ET.SubElement(result_elem, "Value").text = str(item.get('value', ''))
+            parsed = json.loads(json_result)
+            sessions[session_id]['extraction_results'] = parsed
+
+            return jsonify({
+                "status": "success",
+                "data": parsed,
+                "text_sample": full_text[:500] + "..." if len(full_text) > 500 else full_text
+            })
+        except json.JSONDecodeError:
+            return jsonify({
+                "status": "partial_success",
+                "raw_response": llm_response,
+                "message": "Could not parse LLM response as JSON"
+            })
             
-            xml_str = ET.tostring(root, encoding='unicode')
-            st.code(xml_str, language="xml")
-        except Exception as e:
-            st.error(f"Error generating XML: {str(e)}")
+    except Exception as e:
+        abort(500, f"Analysis failed: {str(e)}")
 
-    # Download options
-    st.write("")
-    st.write("")
-    st.subheader("📥 Download Results")
-    file_data = None
-    filename = ""
-    mime = ""
 
-    with st.expander("Download Options", expanded=True):
-        dl_col1, dl_col2 = st.columns(2)
+@app.route('/download/<format>', methods=['GET'])
+def download_result(format):
+    session_id = request.args.get('session_id')
+    if not session_id or session_id not in sessions:
+        abort(404, "Invalid or expired session ID")
+    
+    result_data = sessions[session_id].get('extraction_results')
+    if not result_data:
+        abort(404, "No results available for this session")
 
-        with dl_col1:
-            if st.button("Download as JSON"):
-                file_data = download_from_backend("json")
-                if file_data:
-                    mime = "application/json"
-                    filename = "extraction_results.json"
-            if st.button("Download as Text"):
-                file_data = download_from_backend("txt")
-                if file_data:
-                    mime = "text/plain"
-                    filename = "extraction_results.txt"
+    output = io.BytesIO()
 
-            if st.button("Download as XML"):
-                file_data = download_from_backend("xml")
-                if file_data:
-                    mime = "application/xml"
-                    filename = "extraction_results.xml"
+    try:
+        if format == 'json':
+            output.write(json.dumps(result_data, indent=2).encode('utf-8'))
+            o_format = "extracted_data.json"
+            mime = "application/json"
 
-            if st.button("Download as DOCX"):
-                file_data = download_from_backend("docx")
-                if file_data:
-                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    filename = "extraction_results.docx"
+        elif format == 'txt':
+            text = '\n'.join(f"{item['field']}: {item['value']}" for item in result_data['results'])
+            output.write(text.encode('utf-8'))
+            o_format = "extracted_data.txt"
+            mime = "text/plain"
 
-            if st.button("Download as PDF"):
-                file_data = download_from_backend("pdf")
-                if file_data:
-                    mime = "application/pdf"
-                    filename = "extraction_results.pdf"
+        elif format == 'xml':
+            xml = "<results>\n"
+            for item in result_data['results']:
+                xml += f"  <field name= '{item['field']}' confidence='{item['confidence']}'>\n"
+                xml += f"   <value>{item['value']}</value>\n"
+                xml += f"  </field>\n"
+            xml += "</results>"
+            output.write(xml.encode('utf-8'))
+            o_format = "extracted_data.xml"
+            mime = "application/xml"
 
-        with dl_col2:
-            if file_data:
-                st.download_button("Click to save", file_data, filename, mime=mime)
+        elif format == 'docx':
+            doc = DocxDocument()
+            doc.add_heading("Extracted Data", level=1)
+            for item in result_data['results']:
+                doc.add_paragraph(f" {item['field']}: {item['value']}")  # output in format of Key-value pair
+            doc.save(output)
+            output.seek(0)
+            o_format = "extracted_data.docx"
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        
+        elif format == 'pdf':
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            for item in result_data['results']:
+                pdf.multi_cell(0, 10, f"{item['field']}: {item['value'].encode('latin-1', 'replace').decode('latin-1')}")
+            pdf_output = pdf.output(dest='S').encode('latin-1')
+            output.write(pdf_output)
+            o_format = "extracted_data.pdf"
+            mime = "application/pdf"
+        else:
+            abort(400, "Unsupported export format")
 
-# Session info footer
-if st.session_state.config_uploaded:
-    st.markdown("---")
-    st.caption(f"Active session: `{st.session_state.session_id}`")
+        output.seek(0)
+        return send_file(output, as_attachment=True, download_name=o_format, mimetype=mime)
 
-st.markdown("---")
-st.caption("Document Analyzer - Powered by OpenRouter AI")
+    except Exception as e:
+        abort(500, f"Error generating {format} file: {str(e)}")
+
+
+@app.route('/session/<session_id>', methods=['GET'])
+def get_session(session_id):
+    """Check session status"""
+    if session_id not in sessions:
+        abort(404, "Session not found")
+    
+    return jsonify({
+        "status": "active",
+        "expires_at": sessions[session_id]['expiry'].isoformat(),
+        "fields": [f['name'] for f in sessions[session_id]['config']['fields']]
+    })
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Document Analysis API",
+        "endpoints": {
+            "/upload_config": "POST - Upload configuration",
+            "/upload_documents": "POST - Upload documents with session_id",
+            "/session/<id>": "GET - Check session status",
+            "/health": "GET - Service health"
+        }
+    })
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "active_sessions": len(sessions)
+    })
+
+if __name__ == '__main__':
+    # Verify Tesseract installation
+    try:
+        pytesseract.get_tesseract_version()
+    except EnvironmentError:
+        print("Warning: Tesseract OCR not installed")
+    
+    app.run(host='0.0.0.0', port=5001, debug=True)
