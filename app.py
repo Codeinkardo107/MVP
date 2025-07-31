@@ -1,11 +1,13 @@
 import os
 import json
+from turtle import st
+from urllib import response
 import yaml
 import uuid
 import tempfile
 import shutil
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, abort, send_file
+from flask import Flask, request, jsonify, abort
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
@@ -13,10 +15,8 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 import io
+import pandas as pd
 import requests  # For OpenRouter API calls
-import pandas as pd  # For CSV/Excel processing
-from docx import Document as DocxDocument  # For DOCX generation
-from fpdf import FPDF  # For PDF generation
 
 # LangChain imports (still used for text processing)
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -35,7 +35,7 @@ CORS(app, origins=["http://localhost:8501", "http://127.0.0.1:8501"],
 # Configuration
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 400
-SUPPORTED_DOC_TYPES = [".pdf", ".docx", ".txt", ".csv", ".xlsx"]
+SUPPORTED_DOC_TYPES = [".pdf", ".docx", ".txt", ".xlsx", ".csv"]
 SUPPORTED_CONFIG_TYPES = [".yaml", ".yml", ".json"]
 MIN_TEXT_LENGTH = 50
 MAX_CONFIG_SIZE = 1 * 1024 * 1024  # 1MB
@@ -50,7 +50,7 @@ OPENROUTER_MODEL = "anthropic/claude-3-opus"  # Can be changed to any supported 
 
 def allowed_document_file(filename):
     return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in {'pdf', 'docx', 'txt', 'csv', 'xlsx'}
+           filename.rsplit('.', 1)[1].lower() in {'pdf', 'docx', 'txt', 'xlsx', 'csv'}
 
 def allowed_config_file(filename):
     return '.' in filename and \
@@ -115,7 +115,7 @@ def parse_config_file(file):
                         raise ValueError("Each field must be a dictionary")
                     if 'keywords' not in field:
                         raise ValueError("Field missing 'keywords' list")
-                
+                    
                 return config
                 
     except (yaml.YAMLError, json.JSONDecodeError) as e:
@@ -215,7 +215,7 @@ def upload_documents():
         abort(400, "Session ID required")
     
     session_id = request.form['session_id']
-    if session_id not in sessions:
+    if session_id not in sessions or datetime.now() > sessions[session_id]['expiry']:
         abort(400, "Invalid or expired session ID")
     
     config = sessions[session_id]['config']
@@ -287,14 +287,6 @@ def upload_documents():
                         print("WARNING: Excel sheet is empty after cleaning.")
                         docs = []
 
-                    # Only load if we have a valid loader
-
-                    if docs:
-                        documents.extend(docs)
-                        print(f"Loaded {len(docs)} documents from {filename}")
-                    else:
-                        print(f"WARNING: Unsupported file format: {filename}")
-                        
                     
             except Exception as e:
                 continue
@@ -336,8 +328,6 @@ def upload_documents():
         
         try:
             parsed = json.loads(json_result)
-            sessions[session_id]['extraction_results'] = parsed
-
             return jsonify({
                 "status": "success",
                 "data": parsed,
@@ -352,72 +342,6 @@ def upload_documents():
             
     except Exception as e:
         abort(500, f"Analysis failed: {str(e)}")
-
-
-@app.route('/download/<format>', methods=['GET'])
-def download_result(format):
-    session_id = request.args.get('session_id')
-    if not session_id or session_id not in sessions:
-        abort(404, "Invalid or expired session ID")
-    
-    result_data = sessions[session_id].get('extraction_results')
-    if not result_data:
-        abort(404, "No results available for this session")
-
-    output = io.BytesIO()
-
-    try:
-        if format == 'json':
-            output.write(json.dumps(result_data, indent=2).encode('utf-8'))
-            o_format = "extracted_data.json"
-            mime = "application/json"
-
-        elif format == 'txt':
-            text = '\n'.join(f"{item['field']}: {item['value']}" for item in result_data['results'])
-            output.write(text.encode('utf-8'))
-            o_format = "extracted_data.txt"
-            mime = "text/plain"
-
-        elif format == 'xml':
-            xml = "<results>\n"
-            for item in result_data['results']:
-                xml += f"  <field name= '{item['field']}' confidence='{item['confidence']}'>\n"
-                xml += f"   <value>{item['value']}</value>\n"
-                xml += f"  </field>\n"
-            xml += "</results>"
-            output.write(xml.encode('utf-8'))
-            o_format = "extracted_data.xml"
-            mime = "application/xml"
-
-        elif format == 'docx':
-            doc = DocxDocument()
-            doc.add_heading("Extracted Data", level=1)
-            for item in result_data['results']:
-                doc.add_paragraph(f" {item['field']}: {item['value']}")  # output in format of Key-value pair
-            doc.save(output)
-            output.seek(0)
-            o_format = "extracted_data.docx"
-            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        
-        elif format == 'pdf':
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Arial", size=12)
-            for item in result_data['results']:
-                pdf.multi_cell(0, 10, f"{item['field']}: {item['value'].encode('latin-1', 'replace').decode('latin-1')}")
-            pdf_output = pdf.output(dest='S').encode('latin-1')
-            output.write(pdf_output)
-            o_format = "extracted_data.pdf"
-            mime = "application/pdf"
-        else:
-            abort(400, "Unsupported export format")
-
-        output.seek(0)
-        return send_file(output, as_attachment=True, download_name=o_format, mimetype=mime)
-
-    except Exception as e:
-        abort(500, f"Error generating {format} file: {str(e)}")
-
 
 @app.route('/session/<session_id>', methods=['GET'])
 def get_session(session_id):
